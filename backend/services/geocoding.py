@@ -1,8 +1,12 @@
 """Forward / reverse geocoding service.
 
-Forward search supports three providers selected per-request:
+Forward search supports four providers selected per-request:
 
-* ``nominatim`` — default, the OSM-backed public Nominatim instance. Free,
+* ``arcgis`` — default, the Esri World Geocoder. Works without a token;
+  the user may add their own ArcGIS Location Platform key. Global POI +
+  address coverage including CJK names, answers in < 1 s. Falls back to
+  Photon if Esri refuses or fails.
+* ``nominatim`` — the OSM-backed public Nominatim instance. Free,
   no key, but Asian street-level accuracy is weak.
 * ``photon`` — komoot-hosted, also OSM-backed, free, no key. Better fuzzy
   matching and typo tolerance than Nominatim, looser rate limits in
@@ -43,7 +47,13 @@ from models.schemas import GeocodingResult
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+# Photon's public instance often takes 8-20 s per query, so 10 s cut
+# most searches off mid-answer.
+_PHOTON_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 _GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+_ARCGIS_GEOCODE_URL = (
+    "https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates"
+)
 
 # Reverse cache: 3 decimals is a ~110 m cell, fine for a flag + place label.
 _REVERSE_CACHE_DECIMALS = 3
@@ -72,10 +82,36 @@ class GeocodingService:
         self,
         query: str,
         limit: int = 5,
-        provider: str = "nominatim",
+        provider: str = "arcgis",
         google_key: str | None = None,
+        arcgis_key: str | None = None,
     ) -> list[GeocodingResult]:
         """Forward geocode: address or place name -> coordinates."""
+        # Network trouble used to escape as a bare 500 "Internal Server
+        # Error"; give the search box a message the user can act on.
+        try:
+            return await self._search(query, limit, provider, google_key, arcgis_key)
+        except httpx.TimeoutException as exc:
+            logger.warning("Geocode search timed out (%s): %r", provider, exc)
+            raise HTTPException(
+                status_code=504,
+                detail={"code": "geocode_timeout", "message": "Search service timed out"},
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("Geocode search failed (%s): %r", provider, exc)
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "geocode_unavailable", "message": f"Search service error: {exc}"},
+            )
+
+    async def _search(
+        self,
+        query: str,
+        limit: int,
+        provider: str,
+        google_key: str | None,
+        arcgis_key: str | None,
+    ) -> list[GeocodingResult]:
         if provider == "google":
             if not google_key:
                 raise HTTPException(
@@ -83,6 +119,19 @@ class GeocodingService:
                     detail="provider=google requires google_key",
                 )
             return await self._search_google(query, limit, google_key)
+        if provider == "arcgis":
+            try:
+                try:
+                    return await self._search_arcgis(query, limit, arcgis_key)
+                except httpx.HTTPStatusError as exc:
+                    if not arcgis_key:
+                        raise
+                    # Bad / expired / over-quota key: keyless still works.
+                    logger.warning("ArcGIS rejected the user's key (%s), retrying without it", exc)
+                    return await self._search_arcgis(query, limit)
+            except httpx.HTTPError as exc:
+                logger.warning("ArcGIS search failed (%r), falling back to Photon", exc)
+                return await self._search_photon(query, limit)
         if provider == "photon" or GeocodingService._nominatim_refused:
             return await self._search_photon(query, limit)
         try:
@@ -136,7 +185,7 @@ class GeocodingService:
         # synthesise one from the properties for parity with Nominatim.
         params = {"q": query, "limit": min(limit, 40)}
         logger.debug("Photon search: %s", query)
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=_PHOTON_TIMEOUT) as client:
             resp = await client.get(
                 f"{PHOTON_BASE_URL}/api",
                 params=params,
@@ -150,6 +199,56 @@ class GeocodingService:
             r = _photon_feature_to_result(feat, query)
             if r:
                 results.append(r)
+        return results
+
+    async def _search_arcgis(
+        self, query: str, limit: int, token: str | None = None
+    ) -> list[GeocodingResult]:
+        # Esri World Geocoder. Global POI + address coverage with CJK
+        # names, typically answers in < 1 s. Works without a token; a
+        # user-supplied key is sent as `token` (results not stored, so
+        # forStorage stays at its default false).
+        params = {
+            "SingleLine": query,
+            "f": "json",
+            "maxLocations": min(limit, 50),
+            "outFields": "LongLabel,ShortLabel,Type,Addr_type",
+        }
+        if token:
+            params["token"] = token
+        logger.debug("ArcGIS search: %s", query)
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(_ARCGIS_GEOCODE_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        # ArcGIS reports its own failures (bad token, quota) as HTTP 200
+        # with an "error" body; treat that like an HTTP failure so the
+        # caller falls back to Photon.
+        if "error" in data:
+            err = data["error"] or {}
+            raise httpx.HTTPStatusError(
+                f"ArcGIS error {err.get('code')}: {err.get('message')}",
+                request=resp.request,
+                response=resp,
+            )
+
+        results: list[GeocodingResult] = []
+        for cand in data.get("candidates") or []:
+            try:
+                loc = cand["location"]
+                attrs = cand.get("attributes") or {}
+                results.append(
+                    GeocodingResult(
+                        display_name=attrs.get("LongLabel") or cand.get("address", ""),
+                        lat=float(loc["y"]),
+                        lng=float(loc["x"]),
+                        type=attrs.get("Type") or attrs.get("Addr_type", ""),
+                        importance=float(cand.get("score", 0)) / 100,
+                        short_name=attrs.get("ShortLabel", ""),
+                    )
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                logger.warning("Skipping malformed ArcGIS result: %s", exc)
         return results
 
     async def _search_google(
@@ -244,7 +343,7 @@ class GeocodingService:
     async def _reverse_photon(self, lat: float, lng: float) -> GeocodingResult | None:
         logger.debug("Photon reverse: %.6f, %.6f", lat, lng)
 
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=_PHOTON_TIMEOUT) as client:
             resp = await client.get(
                 f"{PHOTON_BASE_URL}/reverse",
                 params={"lat": lat, "lon": lng},

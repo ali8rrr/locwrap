@@ -28,6 +28,8 @@ const ERROR_I18N: Record<string, { zh: string; en: string }> = {
   no_position: { zh: '尚未取得目前位置,請先跳點到一個座標', en: 'No current position, teleport to a coordinate first' },
   tunnel_lost: { zh: 'WiFi Tunnel 連線中斷,請重新建立', en: 'Wi-Fi tunnel dropped, please reconnect' },
   cooldown_active: { zh: '冷卻中,請等待後再跳點', en: 'Cooldown active, wait before teleporting' },
+  geocode_timeout: { zh: '地址搜尋服務回應逾時,請稍後再試或換一個搜尋來源', en: 'Address search timed out, try again later or switch the search provider' },
+  geocode_unavailable: { zh: '地址搜尋服務暫時無法使用,請稍後再試或換一個搜尋來源', en: 'Address search service is unavailable, try again later or switch the search provider' },
   repair_needs_usb: { zh: '重新配對需要 USB, 請先用線連接 iPhone', en: 'Re-pair needs USB, please connect the iPhone first' },
   usbmux_unavailable: { zh: '無法列出 USB 裝置,請確認驅動與 Apple Mobile Device Service 是否正常', en: 'Cannot list USB devices, check iTunes/Apple Mobile Device Service' },
   trust_failed: { zh: 'USB 信任失敗, 請在 iPhone 上點「信任」後再試', en: 'USB trust failed, tap Trust on the iPhone and retry' },
@@ -243,23 +245,22 @@ export const setCoordFormat = (format: string) =>
 //
 // Provider + API key are read from localStorage on every call so the
 // caller doesn't have to thread them through the component tree. If
-// the user picked Google but never saved a key, fall back to nominatim
+// the user picked Google but never saved a key, fall back to ArcGIS
 // silently rather than letting the backend 400.
 export const searchAddress = (q: string) => {
-  let provider = 'nominatim'
+  let provider = 'arcgis'
   let googleKey = ''
+  let arcgisKey = ''
   try {
-    provider = localStorage.getItem('locwarp.geocode_provider') || 'nominatim'
+    provider = localStorage.getItem('locwarp.geocode_provider') || 'arcgis'
     googleKey = localStorage.getItem('locwarp.google_geocode_key') || ''
+    arcgisKey = localStorage.getItem('locwarp.arcgis_geocode_key') || ''
   } catch { /* storage disabled */ }
-  if (provider === 'google' && !googleKey) provider = 'nominatim'
-  const params = new URLSearchParams({ q })
-  if (provider === 'google') {
-    params.set('provider', 'google')
-    params.set('google_key', googleKey)
-  } else if (provider === 'photon') {
-    params.set('provider', 'photon')
-  }
+  if (provider === 'google' && !googleKey) provider = 'arcgis'
+  const params = new URLSearchParams({ q, provider })
+  if (provider === 'google') params.set('google_key', googleKey)
+  // ArcGIS works keyless; the user's own key is optional.
+  if (provider === 'arcgis' && arcgisKey) params.set('arcgis_key', arcgisKey)
   return request<any[]>('GET', `/api/geocode/search?${params.toString()}`)
 }
 // The backend caches reverse results per ~100 m cell. Pass precise=true
@@ -270,8 +271,8 @@ export const reverseGeocode = (lat: number, lng: number, precise = false) =>
 
 // Mirror the desktop's geocode provider choice to the backend so the phone
 // page (which can't read renderer localStorage) honours the same provider.
-export const setGeocodeProviderPref = (provider: string, googleKey: string = '') =>
-  request<any>('PUT', '/api/geocode/provider-pref', { provider, google_key: googleKey })
+export const setGeocodeProviderPref = (provider: string, googleKey: string = '', arcgisKey: string = '') =>
+  request<any>('PUT', '/api/geocode/provider-pref', { provider, google_key: googleKey, arcgis_key: arcgisKey })
 export const lookupTimezone = (lat: number, lng: number) =>
   request<{ zone: string; gmt_offset_seconds: number; abbreviation: string; timestamp: number } | null>(
     'GET', `/api/geocode/timezone?lat=${lat}&lng=${lng}`,

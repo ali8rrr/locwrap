@@ -32,17 +32,19 @@ geocoding_service = GeocodingService()
 async def search_address(
     q: str,
     limit: int = 5,
-    provider: str = "nominatim",
+    provider: str = "arcgis",
     google_key: str | None = None,
+    arcgis_key: str | None = None,
 ):
     """Forward geocode.
 
-    `provider` is one of ``nominatim`` (default, free, no key),
+    `provider` is one of ``arcgis`` (default, Esri World Geocoder, no
+    key), ``nominatim`` (free, no key),
     ``photon`` (also free / no key, fuzzy-friendly OSM mirror at
     komoot.io), or ``google`` (requires `google_key`, 10k events/month
     free tier on Google's Essentials plan).
     """
-    return await geocoding_service.search(q, limit, provider, google_key)
+    return await geocoding_service.search(q, limit, provider, google_key, arcgis_key)
 
 
 @router.get("/reverse", response_model=GeocodingResult | None)
@@ -51,8 +53,10 @@ async def reverse_geocode(lat: float, lng: float, precise: bool = False):
 
 
 class ProviderPref(BaseModel):
-    provider: str = Field(pattern="^(nominatim|photon|google)$")
+    provider: str = Field(pattern="^(arcgis|nominatim|photon|google)$")
     google_key: str = ""
+    # None leaves the stored ArcGIS key alone, "" clears it.
+    arcgis_key: str | None = None
 
 
 @router.get("/provider-pref")
@@ -64,6 +68,7 @@ async def get_provider_pref():
     return {
         "provider": app_state._geocode_provider,
         "has_google_key": bool(app_state._google_geocode_key),
+        "has_arcgis_key": bool(app_state._arcgis_geocode_key),
     }
 
 
@@ -81,6 +86,8 @@ async def set_provider_pref(pref: ProviderPref):
     elif pref.provider != "google":
         # Allow explicit clear when switching away from google.
         pass
+    if pref.arcgis_key is not None:
+        app_state._arcgis_geocode_key = pref.arcgis_key.strip()
     app_state.save_settings()
     return {"ok": True}
 

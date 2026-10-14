@@ -631,13 +631,16 @@ async def phone_geocode(
     _check_token(_resolve_token(request, x_locwarp_token, t))
     from services.geocoding import GeocodingService
     from main import app_state
-    provider = app_state._geocode_provider or "nominatim"
+    provider = app_state._geocode_provider or "arcgis"
     google_key = app_state._google_geocode_key or None
     if provider == "google" and not google_key:
-        provider = "nominatim"  # safety fallback if key got cleared
+        provider = "arcgis"  # safety fallback if key got cleared
     svc = GeocodingService()
     try:
-        results = await svc.search(q, limit=8, provider=provider, google_key=google_key)
+        results = await svc.search(
+            q, limit=8, provider=provider, google_key=google_key,
+            arcgis_key=app_state._arcgis_geocode_key or None,
+        )
     except Exception as e:
         logger.exception("phone geocode failed (provider=%s): %s", provider, e)
         raise HTTPException(status_code=500, detail=str(e))
