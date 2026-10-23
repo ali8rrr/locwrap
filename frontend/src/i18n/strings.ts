@@ -299,9 +299,12 @@ export const STRINGS = {
   'wifi.recent_ips_button': { zh: '最近 {n}', en: 'Recent {n}' },
   'wifi.recent_ips_tooltip': {
     zh: '從最近連線過的 IP 直接挑一個帶回欄位,免重打',
-    en: 'Pick a recently used IP — fills the field without retyping',
+    en: 'Pick a recently used IP, fills the field without retyping',
   },
   'wifi.recent_ip_delete_tooltip': { zh: '刪除這筆紀錄', en: 'Delete this entry' },
+  'wifi.recent_ips_group_current': { zh: '目前網路 ({prefix}.x)', en: 'Current network ({prefix}.x)' },
+  'wifi.recent_ips_group_other': { zh: '其他網路', en: 'Other networks' },
+  'wifi.recent_ips_other_toggle': { zh: '其他網路 ({n})', en: 'Other networks ({n})' },
   'wifi.tunnel_local_endpoint': { zh: '本機通道', en: 'Local tunnel' },
   'wifi.pin_on': { zh: '已釘選', en: 'Pinned' },
   'wifi.pin_off': { zh: '釘選', en: 'Pin' },

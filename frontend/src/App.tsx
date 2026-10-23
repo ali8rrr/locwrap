@@ -10,6 +10,8 @@ import UserAvatarPicker from './components/UserAvatarPicker'
 import { UserAvatar, avatarToHtml, loadAvatar, saveAvatar, loadCustomPng, saveCustomPng } from './userAvatars'
 import * as api from './services/api'
 import { parseCoord } from './utils/coords'
+import { readSavedIps, savedIpsForPrefix, prefixOf } from './utils/savedTunnelIps'
+import { getHostPrefix } from './utils/hostNetwork'
 
 import MapView from './components/MapView'
 import ControlPanel from './components/ControlPanel'
@@ -391,28 +393,21 @@ const App: React.FC = () => {
     if (!ws.connected) return
     if (wifiAutoConnectAttemptedRef.current) return
     let enabled: boolean
-    let savedList: Array<{ ip: string; port: number; udid?: string }> = []
+    let savedList: Array<{ ip: string; port: number; udid?: string; prefix?: string; lastUsed: number }> = []
     try {
       enabled = localStorage.getItem('locwarp.tunnel.autoconnect') !== '0'
-      const raw = localStorage.getItem('locwarp.tunnel.savedips') || '[]'
-      try {
-        const parsed = JSON.parse(raw)
-        if (Array.isArray(parsed)) {
-          savedList = parsed
-            .filter((e) => e && typeof e.ip === 'string' && e.ip.trim())
-            .map((e) => ({
-              ip: String(e.ip).trim(),
-              port: Number(e.port) || 49152,
-              udid: typeof e.udid === 'string' && e.udid ? e.udid : undefined,
-            }))
-        }
-      } catch { /* ignore — fall back to legacy below */ }
+      savedList = readSavedIps()
       // Legacy single-IP fallback for upgraders.
       if (savedList.length === 0) {
         const legacyIp = (localStorage.getItem('locwarp.tunnel.ip') || '').trim()
         if (legacyIp) {
           const portStr = localStorage.getItem('locwarp.tunnel.port') || '49152'
-          savedList = [{ ip: legacyIp, port: parseInt(portStr, 10) || 49152 }]
+          savedList = [{
+            ip: legacyIp,
+            port: parseInt(portStr, 10) || 49152,
+            prefix: prefixOf(legacyIp) || undefined,
+            lastUsed: 0,
+          }]
         }
       }
     } catch {
@@ -462,11 +457,28 @@ const App: React.FC = () => {
             if (Array.isArray(p)) pinnedUdids.push(...p.filter((x: any) => typeof x === 'string'))
           } catch { /* ignore */ }
           const hasPins = pinnedUdids.length > 0
-          const filteredList = hasPins
+          const pinFiltered = hasPins
             ? savedList.filter((e) => e.udid && pinnedUdids.includes(e.udid))
             : savedList
-
-          for (const entry of filteredList) addCand(entry.ip, entry.port, entry.udid)
+          // Only try addresses that belong to the WiFi this PC is on right
+          // now. A phone saved under several LANs would otherwise burn a
+          // ~10s handshake timeout per unreachable address and eat into the
+          // MAX_DEVICES candidate budget below, pushing out the address
+          // that actually works (issue #48). An unknown host prefix leaves
+          // every saved address in play, as before.
+          const hostPrefix = await getHostPrefix()
+          const filteredList = savedIpsForPrefix(pinFiltered, hostPrefix)
+          // One candidate per phone: entries written before the prefix tag
+          // existed can leave two addresses for the same device in the
+          // list, and the newest (first after the sort) is the live one.
+          const udidSeen = new Set<string>()
+          for (const entry of filteredList) {
+            if (entry.udid) {
+              if (udidSeen.has(entry.udid)) continue
+              udidSeen.add(entry.udid)
+            }
+            addCand(entry.ip, entry.port, entry.udid)
+          }
           // Skip mDNS discover when user has pins — avoids connecting to
           // unintended devices on the same network. Discover only runs
           // when no pins are set so new users can still auto-connect.

@@ -6,6 +6,11 @@ import {
   type TunnelInfo,
 } from '../services/api'
 import type { WsMessage } from './useWebSocket'
+import {
+  readSavedIps, savedIpsForPrefix, upsertSavedIp,
+  type SavedTunnelIp,
+} from '../utils/savedTunnelIps'
+import { getHostPrefix } from '../utils/hostNetwork'
 
 export interface DeviceInfo {
   udid: string
@@ -253,14 +258,24 @@ export function useDevice(subscribe?: WsSubscribe) {
     if (tmr) { clearTimeout(tmr); delete pinRetryTimers.current[udid] }
   }, [])
 
+  // Newest saved address for a device, without waiting on the host-prefix
+  // probe. Used by togglePin, which runs inside a setState updater.
   const readSavedEntryFor = (udid: string): { ip: string; port: number } | null => {
-    try {
-      const arr = JSON.parse(localStorage.getItem('locwarp.tunnel.savedips') || '[]')
-      if (!Array.isArray(arr)) return null
-      const hit = arr.find((e: any) => e && e.udid === udid && typeof e.ip === 'string')
-      if (hit) return { ip: hit.ip, port: Number(hit.port) || 49152 }
-    } catch { /* ignore */ }
-    return null
+    const hit = readSavedIps()
+      .filter((e) => e.udid === udid)
+      .sort((a, b) => b.lastUsed - a.lastUsed)[0]
+    return hit ? { ip: hit.ip, port: hit.port } : null
+  }
+
+  // Addresses to retry a pinned device on, best first. A phone can be saved
+  // under several LANs (home / office / hotspot), so we keep only the ones
+  // whose prefix matches the network this PC is on right now, newest first
+  // (issue #48). Unknown host prefix leaves every saved address in play.
+  const readSavedEntriesFor = async (udid: string): Promise<SavedTunnelIp[]> => {
+    const mine = readSavedIps().filter((e) => e.udid === udid)
+    if (mine.length === 0) return []
+    const prefix = await getHostPrefix()
+    return savedIpsForPrefix(mine, prefix)
   }
 
   const schedulePinReconnect = useCallback((udid: string, delayMs = 5000) => {
@@ -270,12 +285,17 @@ export function useDevice(subscribe?: WsSubscribe) {
       // Stop if the user unpinned, or the tunnel already came back.
       if (!pinnedRef.current.includes(udid)) return
       if (tunnelsRef.current.some((tn) => tn.udid === udid)) return
-      const entry = readSavedEntryFor(udid)
-      if (entry && startWifiTunnelRef.current) {
+      const entries = await readSavedEntriesFor(udid)
+      for (const entry of entries) {
+        if (!startWifiTunnelRef.current) break
+        // Re-check between attempts: the user may have unpinned, or an
+        // earlier candidate's tunnel may have come up meanwhile.
+        if (!pinnedRef.current.includes(udid)) return
+        if (tunnelsRef.current.some((tn) => tn.udid === udid)) return
         try {
           await startWifiTunnelRef.current(entry.ip, entry.port, udid)
           return // success path clears the timer via startWifiTunnel
-        } catch { /* fall through and reschedule */ }
+        } catch { /* try the next saved address, then reschedule */ }
       }
       if (pinnedRef.current.includes(udid) && !tunnelsRef.current.some((tn) => tn.udid === udid)) {
         pinRetryTimers.current[udid] = setTimeout(attempt, 15000)
@@ -402,26 +422,13 @@ export function useDevice(subscribe?: WsSubscribe) {
         // next launch only auto-connects whichever iPhone the user once
         // manually clicked through. v0.2.110 bug surfaced when a user
         // with two iPhones only had one of them in savedips.
-        try {
-          const raw = localStorage.getItem('locwarp.tunnel.savedips') || '[]'
-          const list = (() => {
-            try { return JSON.parse(raw) as Array<{ ip: string; port: number; udid?: string; name?: string; lastUsed: number }> }
-            catch { return [] }
-          })()
-          const baseList = Array.isArray(list) ? list : []
-          // Dedup by both (ip, port) AND by udid — covers the case where
-          // an iPhone reconnects on a NEW DHCP-assigned IP. Without the
-          // udid dedup we'd accumulate stale IPs for the same device.
-          const filtered = baseList.filter((e) =>
-            e && !(e.ip === ip && (e.port === port || e.port === usedPort))
-            && !(res.udid && e.udid === res.udid)
-          )
-          // Persist the device name too so the panel can keep showing the
-          // real phone name after a WiFi drop instead of a raw UDID
-          // (issue #33).
-          const next = [{ ip, port: usedPort, udid: res.udid, name: res.name, lastUsed: Date.now() }, ...filtered].slice(0, 5)
-          localStorage.setItem('locwarp.tunnel.savedips', JSON.stringify(next))
-        } catch { /* storage disabled */ }
+        // Dedup is by (ip, port) and by (udid, LAN prefix): a phone that
+        // got a new DHCP address on the same WiFi replaces its old entry,
+        // while the same phone on another WiFi is kept alongside it so
+        // switching networks doesn't erase the other one (issue #48).
+        // The device name rides along so the panel can keep showing the
+        // real phone name after a drop instead of a raw UDID (issue #33).
+        upsertSavedIp({ ip, port: usedPort, udid: res.udid, name: res.name })
         // A successful connect clears any pending pin-retry for this device.
         clearPinRetry(res.udid)
         return { ...info, port: usedPort }

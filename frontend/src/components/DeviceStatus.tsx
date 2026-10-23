@@ -2,6 +2,11 @@ import React, { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { wifiTunnelDiscover, wifiTunnelFindPort, wifiRepair, wifiKeepaliveGet, wifiKeepaliveSet, type TunnelInfo } from '../services/api';
 import { useT } from '../i18n';
+import {
+  readSavedIps, removeSavedIp as removeSavedIpEntry, entryPrefix,
+  type SavedTunnelIp,
+} from '../utils/savedTunnelIps';
+import { getHostPrefix } from '../utils/hostNetwork';
 
 const MAX_TUNNEL_DEVICES = 3;
 
@@ -54,31 +59,38 @@ const DeviceStatus: React.FC<DeviceStatusProps> = ({
   const [tunnelPort, setTunnelPort] = useState(() => localStorage.getItem('locwarp.tunnel.port') || '');
   const [portScanning, setPortScanning] = useState(false);
   // Saved IPs are written by useDevice.startWifiTunnel into
-  // locwarp.tunnel.savedips as a max-5 ring buffer. Surface them here so
-  // users can re-establish a tunnel to the same iPhone with one click,
+  // locwarp.tunnel.savedips (see utils/savedTunnelIps). Surface them here
+  // so users can re-establish a tunnel to the same iPhone with one click,
   // instead of retyping the IP after every WiFi drop / manual Stop
   // (issue #29). Refresh whenever the dropdown is toggled or after a
   // successful connect so the list reflects useDevice's latest write.
-  const readSavedIps = (): Array<{ ip: string; port: number; udid?: string; lastUsed: number }> => {
-    try {
-      const raw = localStorage.getItem('locwarp.tunnel.savedips') || '[]';
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter((e) => e && typeof e.ip === 'string' && typeof e.port === 'number');
-    } catch { return []; }
-  };
-  const [savedIps, setSavedIps] = useState(readSavedIps);
+  const [savedIps, setSavedIps] = useState<SavedTunnelIp[]>(readSavedIps);
   const [showSavedIps, setShowSavedIps] = useState(false);
-  const refreshSavedIps = () => setSavedIps(readSavedIps());
-  // Let users prune stale entries (e.g. after switching WiFi networks the
-  // old IP can never work again, and the max-5 ring buffer would otherwise
-  // stay clogged with dead addresses).
+  // The LAN this PC is on, so the dropdown can put the addresses that can
+  // actually work right now above the ones saved on other networks
+  // (issue #48). null until the probe answers, or if it fails.
+  const [hostPrefix, setHostPrefix] = useState<string | null>(null);
+  const refreshSavedIps = () => {
+    setSavedIps(readSavedIps());
+    getHostPrefix().then(setHostPrefix).catch(() => { /* leave ungrouped */ });
+  };
+  // Let users prune stale entries (e.g. an address from a WiFi they won't
+  // be back on).
   const removeSavedIp = (ip: string, port: number) => {
-    const next = readSavedIps().filter((e) => !(e.ip === ip && e.port === port));
-    try { localStorage.setItem('locwarp.tunnel.savedips', JSON.stringify(next)); } catch { /* ignore */ }
+    const next = removeSavedIpEntry(ip, port);
     setSavedIps(next);
     if (next.length === 0) setShowSavedIps(false);
   };
+  const [showOtherNetworks, setShowOtherNetworks] = useState(false);
+  // Newest first within each group. Entries saved before the prefix tag
+  // existed are grouped by the prefix of their own IP.
+  const sortedSavedIps = [...savedIps].sort((a, b) => b.lastUsed - a.lastUsed);
+  const currentNetIps = hostPrefix
+    ? sortedSavedIps.filter((e) => entryPrefix(e) === hostPrefix)
+    : sortedSavedIps;
+  const otherNetIps = hostPrefix
+    ? sortedSavedIps.filter((e) => entryPrefix(e) !== hostPrefix)
+    : [];
   // Map udid -> last known device name, harvested from savedips. Lets the
   // active-tunnel card and recent list keep showing the real phone name
   // after a WiFi drop, instead of falling back to a raw UDID string
@@ -101,6 +113,7 @@ const DeviceStatus: React.FC<DeviceStatusProps> = ({
   const [keepaliveEnabled, setKeepaliveEnabled] = useState<boolean>(true);
   React.useEffect(() => {
     wifiKeepaliveGet().then((r) => setKeepaliveEnabled(r.enabled !== false)).catch(() => { /* keep default */ });
+    getHostPrefix().then(setHostPrefix).catch(() => { /* leave ungrouped */ });
   }, []);
   const handleKeepaliveToggle = (next: boolean) => {
     setKeepaliveEnabled(next);
@@ -191,6 +204,70 @@ const DeviceStatus: React.FC<DeviceStatusProps> = ({
     setTunnelIp(r.ip);
     setTunnelPort(String(r.port));
     setDiscoverResults([]);
+  };
+
+  // Section label inside the recent-IP dropdown. Only rendered when the
+  // list actually spans more than one network.
+  const groupHeaderStyle: React.CSSProperties = {
+    padding: '4px 10px', fontSize: 10, opacity: 0.5,
+    background: 'rgba(255,255,255,0.03)',
+    borderBottom: '1px solid #333',
+    userSelect: 'none',
+  };
+
+  // One row of the recent-IP dropdown. `dim` marks an address saved on a
+  // different WiFi: it stays clickable (the user may be about to switch
+  // networks, or just wants to copy the number) but reads as inactive.
+  const renderSavedIpRow = (entry: SavedTunnelIp, idx: number, dim: boolean) => {
+    const dev = devices.find((d) => d.id === entry.udid);
+    const label = dev?.name || entry.name || (entry.udid ? entry.udid.slice(0, 10) : entry.ip);
+    return (
+      <div
+        key={`${entry.ip}:${entry.port}:${idx}`}
+        onClick={() => {
+          setTunnelIp(entry.ip);
+          setTunnelPort(String(entry.port));
+          setShowSavedIps(false);
+        }}
+        style={{
+          padding: '6px 10px', cursor: 'pointer', fontSize: 11,
+          borderBottom: '1px solid #333',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+          opacity: dim ? 0.55 : 1,
+        }}
+        onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = '#3a3a3e'; }}
+        onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
+      >
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {label}
+          </div>
+          <div style={{ fontSize: 10, opacity: 0.55, fontFamily: 'monospace' }}>
+            {entry.ip}:{entry.port}
+          </div>
+        </div>
+        <button
+          type="button"
+          title={t('wifi.recent_ip_delete_tooltip')}
+          onClick={(e) => {
+            e.stopPropagation();
+            removeSavedIp(entry.ip, entry.port);
+          }}
+          style={{
+            flexShrink: 0, padding: '2px 4px', lineHeight: 0,
+            background: 'transparent', border: 'none',
+            color: '#e07a7a', opacity: 0.6, cursor: 'pointer', borderRadius: 3,
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.opacity = '1'; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.opacity = '0.6'; }}
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+    );
   };
 
   return (
@@ -742,56 +819,29 @@ const DeviceStatus: React.FC<DeviceStatusProps> = ({
                               maxHeight: 180, overflowY: 'auto',
                             }}
                           >
-                            {savedIps.map((entry, idx) => {
-                              const dev = devices.find((d) => d.id === entry.udid);
-                              const label = dev?.name || (entry as any).name || (entry.udid ? entry.udid.slice(0, 10) : entry.ip);
-                              return (
+                            {currentNetIps.length > 0 && (
+                              <>
+                                {hostPrefix && otherNetIps.length > 0 && (
+                                  <div style={groupHeaderStyle}>{t('wifi.recent_ips_group_current', { prefix: hostPrefix })}</div>
+                                )}
+                                {currentNetIps.map((entry, idx) => renderSavedIpRow(entry, idx, false))}
+                              </>
+                            )}
+                            {otherNetIps.length > 0 && (
+                              <>
                                 <div
-                                  key={`${entry.ip}:${entry.port}:${idx}`}
-                                  onClick={() => {
-                                    setTunnelIp(entry.ip);
-                                    setTunnelPort(String(entry.port));
-                                    setShowSavedIps(false);
-                                  }}
-                                  style={{
-                                    padding: '6px 10px', cursor: 'pointer', fontSize: 11,
-                                    borderBottom: '1px solid #333',
-                                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
-                                  }}
-                                  onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = '#3a3a3e'; }}
-                                  onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
+                                  onClick={() => setShowOtherNetworks((v) => !v)}
+                                  style={{ ...groupHeaderStyle, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
                                 >
-                                  <div style={{ minWidth: 0, flex: 1 }}>
-                                    <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                      {label}
-                                    </div>
-                                    <div style={{ fontSize: 10, opacity: 0.55, fontFamily: 'monospace' }}>
-                                      {entry.ip}:{entry.port}
-                                    </div>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    title={t('wifi.recent_ip_delete_tooltip')}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      removeSavedIp(entry.ip, entry.port);
-                                    }}
-                                    style={{
-                                      flexShrink: 0, padding: '2px 4px', lineHeight: 0,
-                                      background: 'transparent', border: 'none',
-                                      color: '#e07a7a', opacity: 0.6, cursor: 'pointer', borderRadius: 3,
-                                    }}
-                                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.opacity = '1'; }}
-                                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.opacity = '0.6'; }}
-                                  >
-                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                      <line x1="18" y1="6" x2="6" y2="18" />
-                                      <line x1="6" y1="6" x2="18" y2="18" />
-                                    </svg>
-                                  </button>
+                                  <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"
+                                    style={{ transform: showOtherNetworks ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
+                                    <polyline points="6,9 12,15 18,9" />
+                                  </svg>
+                                  {t('wifi.recent_ips_other_toggle', { n: otherNetIps.length })}
                                 </div>
-                              );
-                            })}
+                                {showOtherNetworks && otherNetIps.map((entry, idx) => renderSavedIpRow(entry, idx, true))}
+                              </>
+                            )}
                           </div>
                         )}
                       </label>

@@ -1400,6 +1400,24 @@ async def wifi_tunnel_keepalive_set(req: WifiKeepaliveRequest):
     return {"enabled": app_state._wifi_keepalive_enabled}
 
 
+@router.get("/wifi/host-network")
+async def wifi_host_network():
+    """Return this machine's primary IPv4 and its /24 prefix.
+
+    The UI tags every saved tunnel IP with the prefix it was reached on, so
+    it can keep one entry per (device, LAN) instead of overwriting the
+    previous network's address, and only auto-connect the entries that
+    belong to the network we are currently on (issue #48).
+    """
+    ip = _get_primary_local_ip()
+    prefix = None
+    if ip:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            prefix = ".".join(parts[:3])
+    return {"ip": ip, "prefix": prefix}
+
+
 # ── Generic UDID routes (MUST be defined after all specific /wifi/* routes
 #    so that /wifi/* paths do not accidentally match {udid}). ─────────────
 
