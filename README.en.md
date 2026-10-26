@@ -27,21 +27,6 @@
   <img src="docs/demo-v2.gif" width="720" alt="LocWarp demo">
 </p>
 
-## Contents
-
-- [Quick start](#quick-start)
-- [Requirements and compatibility](#requirements-and-compatibility)
-- [Features](#features)
-- [Installation and setup](#installation-and-setup)
-- [Troubleshooting](#troubleshooting)
-- [Developer documentation](#developer-documentation)
-- [Support and contact](#support-and-contact)
-- [About this project](#about-this-project)
-- [License](#license)
-- [Disclaimer](#disclaimer)
-
----
-
 ## Quick start
 
 1. Download the latest `LocWarp Setup x.y.z.exe` from [Releases](https://github.com/keezxc1223/locwarp/releases) and install it.
